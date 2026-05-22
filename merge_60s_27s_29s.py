@@ -6242,6 +6242,129 @@ def naiveBayesPredict():
     return json.dumps(dict_return_data, ensure_ascii=False)
 
 
+@app.route('/dataDifferential', methods=['POST'])
+def data_differential():
+    '''
+    数据微分 —— 基于(x,y)坐标点的数值微分
+    输入自变量 data_x 和因变量 data_y，计算 dy/dx 或 d²y/dx²
+    支持均匀/非均匀采样、多种差分方法
+    :return: 包含微分结果、方法说明的字典
+    '''
+    if request.method == "POST":
+        inputs = request.get_json()
+
+    dict_return_data = {}
+    try:
+        data_x = inputs['data_x']           # 自变量序列
+        data_y = inputs['data_y']           # 因变量序列
+        method = inputs.get('method', 'central')
+        window = inputs.get('window', 3)
+
+        x = np.array(data_x, dtype=float)
+        y = np.array(data_y, dtype=float)
+        n = len(y)
+
+        assert len(x) == n, 'data_x 和 data_y 长度不一致'
+        assert n >= 3, '数据点至少需要 3 个'
+
+        if method == 'first':
+            # 一阶差分: Δy[i] = y[i+1] - y[i], 对应 x 中点
+            result = np.round(np.diff(y), 6).tolist()
+            result_x = np.round((x[1:] + x[:-1]) / 2, 6).tolist()
+
+        elif method == 'second':
+            # 二阶差分: Δ²y[i] = y[i+2] - 2*y[i+1] + y[i]
+            result = np.round(np.diff(y, n=2), 6).tolist()
+            result_x = np.round(x[1:-1], 6).tolist()
+
+        elif method == 'central':
+            # 中心差分: dy/dx[i] = (y[i+1] - y[i-1]) / (x[i+1] - x[i-1])
+            dx = x[2:] - x[:-2]
+            dx[dx == 0] = 1e-10
+            result = np.round((y[2:] - y[:-2]) / dx, 6).tolist()
+            result_x = np.round(x[1:-1], 6).tolist()
+
+        elif method == 'forward':
+            # 前向差分: dy/dx[i] = (y[i+1] - y[i]) / (x[i+1] - x[i])
+            dx = x[1:] - x[:-1]
+            dx[dx == 0] = 1e-10
+            result = np.round(np.diff(y) / dx, 6).tolist()
+            result_x = np.round(x[:-1], 6).tolist()
+
+        elif method == 'backward':
+            # 后向差分: dy/dx[i] = (y[i] - y[i-1]) / (x[i] - x[i-1])
+            dx = x[1:] - x[:-1]
+            dx[dx == 0] = 1e-10
+            result = np.round(np.diff(y) / dx, 6).tolist()
+            result_x = np.round(x[1:], 6).tolist()
+
+        elif method == 'second_central':
+            # 二阶中心差分: d²y/dx²[i] ≈ 2*(y[i+1]*dx0 - y[i]*(dx0+dx1) + y[i-1]*dx1) / (dx0*dx1*(dx0+dx1))
+            # 简化: 对均匀步长 h = (x[i+1]-x[i-1])/2:
+            # d²y/dx²[i] = (y[i+1] - 2*y[i] + y[i-1]) / ((x[i+1]-x[i]) * (x[i]-x[i-1]))
+            dx0 = x[1:-1] - x[:-2]
+            dx1 = x[2:] - x[1:-1]
+            dx0[dx0 == 0] = 1e-10
+            dx1[dx1 == 0] = 1e-10
+            result = np.round((y[2:] - 2 * y[1:-1] + y[:-2]) / (dx0 * dx1), 6).tolist()
+            result_x = np.round(x[1:-1], 6).tolist()
+
+        elif method == 'smooth':
+            # 平滑差分: 先平滑 y 再计算 dy/dx
+            from scipy.ndimage import uniform_filter1d
+            y_smooth = uniform_filter1d(y, size=window, mode='nearest')
+            dx = x[1:] - x[:-1]
+            dx[dx == 0] = 1e-10
+            result = np.round(np.diff(y_smooth) / dx, 6).tolist()
+            result_x = np.round((x[1:] + x[:-1]) / 2, 6).tolist()
+
+        elif method == 'relative':
+            # 相对差分: (y[i+1] - y[i]) / |y[i]|
+            diff = np.diff(y)
+            denom = np.abs(y[:-1])
+            denom[denom == 0] = 1e-10
+            result = np.round(diff / denom, 6).tolist()
+            result_x = np.round((x[1:] + x[:-1]) / 2, 6).tolist()
+
+        elif method == 'log_return':
+            # 对数收益率: ln(y[i+1] / y[i])
+            ratio = y[1:] / y[:-1]
+            result = np.round(np.log(ratio), 6).tolist()
+            result_x = np.round((x[1:] + x[:-1]) / 2, 6).tolist()
+
+        elif method == 'gradient':
+            # 梯度: 二阶精度中心差分(边界自适应)，自动基于 x 计算
+            result = np.round(np.gradient(y, x), 6).tolist()
+            result_x = np.round(x, 6).tolist()
+
+        else:
+            raise ValueError('不支持的差分方法: {}，可选: first/second/central/forward/backward/second_central/smooth/relative/log_return/gradient'.format(method))
+
+        return_data = {
+            'data_x': data_x,
+            'data_y': data_y,
+            'data_length': n,
+            'method': method,
+            'window': window if method == 'smooth' else None,
+            'result_x': result_x,
+            'differential_result': result,
+            'result_length': len(result),
+        }
+
+        dict_return_data['return_data'] = return_data
+        dict_return_data['success'] = True
+        dict_return_data['errorMsg'] = ''
+
+    except Exception as e:
+        dict_return_data['return_data'] = {}
+        dict_return_data['success'] = False
+        dict_return_data['errorMsg'] = str(e)
+        print(f"报错日志：{e}")
+        logger.error(f"报错日志：{e}")
+
+    return json.dumps(dict_return_data, ensure_ascii=False)
+
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', debug=True, port=5130, threaded=True)
 
