@@ -6365,6 +6365,194 @@ def data_differential():
     return json.dumps(dict_return_data, ensure_ascii=False)
 
 
+@app.route('/globalRegressionCoefficient', methods=['POST'])
+def global_regression_coefficient():
+    '''
+    全局回归系数 —— 多元线性回归全统计量分析
+    计算回归系数、标准误差、t值、p值、置信区间、R²、调整R²、F检验、ANOVA表、相关矩阵、VIF
+    :return: 包含完整回归分析结果的字典
+    '''
+    if request.method == "POST":
+        inputs = request.get_json()
+
+    dict_return_data = {}
+    try:
+        data_x = inputs['data_x']                     # 自变量列表 [[x11,x12,...], [x21,x22,...], ...]
+        data_y = inputs['data_y']                     # 因变量列表 [y1, y2, ...]
+        columns_x = inputs['columns_x']               # 自变量名称列表
+        column_y = inputs.get('column_y', 'y')        # 因变量名称
+        alpha = inputs.get('alpha', 0.05)             # 显著性水平
+
+        X = np.array(data_x, dtype=float)             # (n, p)
+        y = np.array(data_y, dtype=float)             # (n,)
+        n, p = X.shape
+        assert n >= p + 2, '样本量至少比自变量个数多 2，当前 n={} p={}'.format(n, p)
+        assert len(columns_x) == p, 'columns_x 长度与 data_x 列数不一致'
+        assert n == len(y), 'data_x 与 data_y 样本量不一致'
+
+        # ── 1. 添加截距项并检查秩 ──
+        X_with_intercept = np.column_stack([np.ones(n), X])
+        rank = np.linalg.matrix_rank(X_with_intercept)
+        assert rank == p + 1, '自变量存在严重多重共线性（矩阵秩不足），无法计算唯一解'
+        beta = np.linalg.lstsq(X_with_intercept, y, rcond=None)[0]
+        intercept = beta[0]
+        coef = beta[1:]
+
+        # ── 2. 预测与残差 ──
+        y_pred = X_with_intercept @ beta
+        residuals = y - y_pred
+        ss_res = np.sum(residuals ** 2)
+        ss_reg = np.sum((y_pred - np.mean(y)) ** 2)
+        ss_total = np.sum((y - np.mean(y)) ** 2)
+
+        # ── 3. 均方与F统计量 ──
+        df_reg = p
+        df_res = n - p - 1
+        ms_reg = ss_reg / df_reg if df_reg > 0 else 0
+        ms_res = ss_res / df_res if df_res > 0 else 0
+        f_stat = ms_reg / ms_res if ms_res > 0 else 0
+        f_p_value = 1 - stats.f.cdf(f_stat, df_reg, df_res)
+
+        # ── 4. R² 与调整 R² ──
+        r_squared = 1 - ss_res / ss_total if ss_total > 0 else 0
+        adj_r_squared = 1 - (ss_res / df_res) / (ss_total / (n - 1)) if (df_res > 0 and n > 1) else 0
+
+        # ── 5. 系数标准误、t值、p值、置信区间 ──
+        var_cov = ms_res * np.linalg.inv(X_with_intercept.T @ X_with_intercept)
+        se = np.sqrt(np.diag(var_cov))
+        t_values = beta / se
+        p_values = 2 * (1 - stats.t.cdf(np.abs(t_values), df_res))
+        t_crit = stats.t.ppf(1 - alpha / 2, df_res)
+        ci_lower = beta - t_crit * se
+        ci_upper = beta + t_crit * se
+
+        intercept_se = se[0]
+        intercept_t = t_values[0]
+        intercept_p = p_values[0]
+        intercept_ci = [round(ci_lower[0], 6), round(ci_upper[0], 6)]
+
+        coef_se = se[1:]
+        coef_t = t_values[1:]
+        coef_p = p_values[1:]
+        coef_ci = [[round(ci_lower[i + 1], 6), round(ci_upper[i + 1], 6)] for i in range(p)]
+
+        # ── 6. 系数表 ──
+        coefficient_table = []
+        for i in range(p):
+            coefficient_table.append({
+                'variable': columns_x[i],
+                'coefficient': round(coef[i], 6),
+                'std_error': round(coef_se[i], 6),
+                't_value': round(coef_t[i], 6),
+                'p_value': round(coef_p[i], 6),
+                'ci_lower': coef_ci[i][0],
+                'ci_upper': coef_ci[i][1],
+                'significance': '***' if coef_p[i] < 0.001 else ('**' if coef_p[i] < 0.01 else ('*' if coef_p[i] < 0.05 else ('.' if coef_p[i] < 0.1 else 'ns')))
+            })
+
+        # ── 7. ANOVA 表 ──
+        anova_table = {
+            'regression': {
+                'df': df_reg, 'ss': round(ss_reg, 6), 'ms': round(ms_reg, 6),
+                'f_value': round(f_stat, 6), 'p_value': round(f_p_value, 6)
+            },
+            'residual': {
+                'df': df_res, 'ss': round(ss_res, 6), 'ms': round(ms_res, 6),
+                'f_value': None, 'p_value': None
+            },
+            'total': {
+                'df': n - 1, 'ss': round(ss_total, 6), 'ms': None,
+                'f_value': None, 'p_value': None
+            }
+        }
+
+        # ── 8. 相关矩阵 ──
+        all_data = np.column_stack([X, y])
+        corr_matrix = np.corrcoef(all_data.T)
+        all_columns = columns_x + [column_y]
+        corr_table = {
+            'columns': all_columns,
+            'data': np.round(corr_matrix, 6).tolist()
+        }
+
+        # ── 9. VIF 方差膨胀因子 ──
+        vif_list = []
+        for i in range(p):
+            x_i = X[:, i]
+            x_others = np.delete(X, i, axis=1)
+            if x_others.shape[1] > 0:
+                x_others_with_intercept = np.column_stack([np.ones(n), x_others])
+                beta_i = np.linalg.lstsq(x_others_with_intercept, x_i, rcond=None)[0]
+                x_i_pred = x_others_with_intercept @ beta_i
+                ss_res_i = np.sum((x_i - x_i_pred) ** 2)
+                ss_total_i = np.sum((x_i - np.mean(x_i)) ** 2)
+                r2_i = 1 - ss_res_i / ss_total_i if ss_total_i > 0 else 0
+            else:
+                r2_i = 0
+            vif = 1 / (1 - r2_i) if r2_i < 1 else float('inf')
+            vif_list.append({'variable': columns_x[i], 'vif': round(vif, 4), 'r2': round(r2_i, 6)})
+
+        # ── 10. 描述统计 ──
+        desc_stats = {}
+        for i in range(p):
+            desc_stats[columns_x[i]] = {
+                'mean': round(np.mean(X[:, i]), 4),
+                'std': round(np.std(X[:, i], ddof=1), 4),
+                'min': round(np.min(X[:, i]), 4),
+                'max': round(np.max(X[:, i]), 4),
+            }
+        desc_stats[column_y] = {
+            'mean': round(np.mean(y), 4),
+            'std': round(np.std(y, ddof=1), 4),
+            'min': round(np.min(y), 4),
+            'max': round(np.max(y), 4),
+        }
+
+        return_data = {
+            'sample_size': n,
+            'variables': p,
+            'columns_x': columns_x,
+            'column_y': column_y,
+            'alpha': alpha,
+            'intercept': {
+                'coefficient': round(intercept, 6),
+                'std_error': round(intercept_se, 6),
+                't_value': round(intercept_t, 6),
+                'p_value': round(intercept_p, 6),
+                'ci_lower': intercept_ci[0],
+                'ci_upper': intercept_ci[1],
+            },
+            'coefficients': coefficient_table,
+            'model_summary': {
+                'r_squared': round(r_squared, 6),
+                'adj_r_squared': round(adj_r_squared, 6),
+                'f_statistic': round(f_stat, 6),
+                'f_p_value': round(f_p_value, 6),
+                'residual_std_error': round(np.sqrt(ms_res), 6),
+                'degrees_of_freedom': [df_reg, df_res],
+            },
+            'anova': anova_table,
+            'correlation_matrix': corr_table,
+            'vif': vif_list,
+            'descriptive_stats': desc_stats,
+            'predictions': np.round(y_pred, 6).tolist(),
+            'residuals': np.round(residuals, 6).tolist(),
+        }
+
+        dict_return_data['return_data'] = return_data
+        dict_return_data['success'] = True
+        dict_return_data['errorMsg'] = ''
+
+    except Exception as e:
+        dict_return_data['return_data'] = {}
+        dict_return_data['success'] = False
+        dict_return_data['errorMsg'] = str(e)
+        print(f"报错日志：{e}")
+        logger.error(f"报错日志：{e}")
+
+    return json.dumps(dict_return_data, ensure_ascii=False)
+
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', debug=True, port=5130, threaded=True)
 
