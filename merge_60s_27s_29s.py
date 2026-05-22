@@ -28,10 +28,12 @@ from sklearn.neural_network import MLPClassifier
 import logging
 from scipy import stats
 from scipy.stats import t
+from scipy.stats import qmc
 from scipy.optimize import curve_fit
 from sklearn.metrics import classification_report
 from utils_29s.process_29s import get_dict_return_discreate
 from sklearn.metrics import mean_squared_error, mean_absolute_error, max_error
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -6734,6 +6736,235 @@ def local_regression_coefficient():
         dict_return_data['errorMsg'] = str(e)
         print(f"报错日志：{e}")
         logger.error(f"报错日志：{e}")
+
+    return json.dumps(dict_return_data, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Sobol 全局灵敏度分析 — 单次调用
+# ═══════════════════════════════════════════════════════════════
+@app.route('/sobolSensitivity', methods=['POST'])
+def sobol_sensitivity():
+    """
+    Sobol 全局灵敏度分析 — 基于方差的敏感度分解
+
+    支持三种输入方式:
+      方式一: data_x + data_y → 自动训练代理模型 → 计算 Sobol 指数
+      方式二: function + param_ranges → 自动评估表达式 → 计算 Sobol 指数
+      方式三: y_A + y_B + y_AB + param_ranges → 直接用已有结果计算
+    """
+    if request.method == "POST":
+        inputs = request.get_json()
+
+    dict_return_data = {}
+    try:
+        # ── 读取输入 ──
+        data_x = inputs.get('data_x', None)
+        data_y = inputs.get('data_y', None)
+        columns_x = inputs.get('columns_x', [])
+        surrogate_type = inputs.get('surrogate', 'rf')
+
+        param_ranges = inputs.get('param_ranges', None)
+        param_names = inputs.get('param_names', [])
+        n_samples = inputs.get('n_samples', 128)
+        func_str = inputs.get('function', None)
+
+        # ── 方式一: data_x + data_y → 用代理模型 ──
+        if data_x is not None and data_y is not None:
+            X_data = np.array(data_x, dtype=float)
+            y_data = np.array(data_y, dtype=float)
+            n_data, p = X_data.shape
+
+            if columns_x:
+                param_names = columns_x
+                assert len(param_names) == p, 'columns_x 长度与 data_x 列数不一致'
+            else:
+                param_names = ['X{}'.format(i + 1) for i in range(p)]
+
+            # 从数据中提取参数范围
+            param_ranges = []
+            for i in range(p):
+                lo, hi = float(X_data[:, i].min()), float(X_data[:, i].max())
+                # 扩展 10% 边界，避免预测时外推过远
+                margin = (hi - lo) * 0.1 if hi > lo else 0.1
+                param_ranges.append([lo - margin, hi + margin])
+
+            # ── 训练代理模型 ──
+            if surrogate_type == 'rf':
+                model = RandomForestRegressor(n_estimators=200, max_depth=None,
+                                              random_state=42, n_jobs=-1)
+            elif surrogate_type == 'gpr':
+                kernel = 1.0 * RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e2)) \
+                         + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-5, 1e1))
+                model = GaussianProcessRegressor(kernel=kernel, normalize_y=True,
+                                                 random_state=42)
+            elif surrogate_type == 'linear':
+                model = LinearRegression()
+            elif surrogate_type == 'svr':
+                model = SVR(kernel='rbf', C=100, gamma='scale')
+            elif surrogate_type == 'mlp':
+                model = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000,
+                                     random_state=42)
+            else:
+                raise ValueError('不支持的 surrogate: {}，可选 rf / gpr / linear / svr / mlp'.format(surrogate_type))
+
+            model.fit(X_data, y_data)
+            _surrogate = lambda X: model.predict(X)
+
+        # ── 方式二/三: param_ranges 模式 ──
+        else:
+            assert param_ranges is not None, '请提供 data_x+data_y 或 param_ranges'
+            p = len(param_ranges)
+            if not param_names:
+                param_names = ['X{}'.format(i + 1) for i in range(p)]
+            assert len(param_names) == p, 'param_names 长度与 param_ranges 不一致'
+
+        # ── 统一生成 Saltelli 采样矩阵 (A, B, A_B_i) ──
+        n = 1
+        while n < n_samples:
+            n *= 2
+        n = max(n, 8)
+
+        log2_n = int(np.log2(n))
+        sobol = qmc.Sobol(d=2 * p, scramble=True, seed=None)
+        sequences = sobol.random_base2(log2_n)       # (n, 2p)
+
+        A_raw = sequences[:, :p]
+        B_raw = sequences[:, p:]
+
+        A = A_raw.copy()
+        B = B_raw.copy()
+        for i in range(p):
+            lo, hi = param_ranges[i]
+            A[:, i] = lo + A[:, i] * (hi - lo)
+            B[:, i] = lo + B[:, i] * (hi - lo)
+
+        A_B_i = []
+        for i in range(p):
+            AB = A.copy()
+            AB[:, i] = B[:, i]
+            A_B_i.append(AB)
+
+        # ── 获取 y_A, y_B, y_AB ──
+        # 方式一: 用代理模型预测
+        if data_x is not None:
+            y_A = _surrogate(A)
+            y_B = np.squeeze(_surrogate(B))
+            y_AB = np.zeros((p, n))
+            for i in range(p):
+                y_AB[i] = np.squeeze(_surrogate(A_B_i[i]))
+
+        # 方式二: function 表达式
+        elif func_str is not None:
+            safe_ns = {'__builtins__': {}, 'np': np, 'abs': abs, 'round': round,
+                       'min': min, 'max': max, 'sum': sum, 'pow': pow}
+
+            def _eval_func(row):
+                local_ns = dict(safe_ns)
+                for k, name in enumerate(param_names):
+                    local_ns[name] = row[k]
+                return float(eval(func_str, local_ns))
+
+            y_A = np.array([_eval_func(A[j]) for j in range(n)])
+            y_B = np.array([_eval_func(B[j]) for j in range(n)])
+            y_AB = np.zeros((p, n))
+            for i in range(p):
+                y_AB[i] = np.array([_eval_func(A_B_i[i][j]) for j in range(n)], dtype=float)
+
+        # 方式三: 已有 y 值
+        elif inputs.get('y_A') is not None:
+            y_A = np.array(inputs['y_A'], dtype=float)
+            y_B = np.array(inputs['y_B'], dtype=float)
+            y_AB_raw = inputs.get('y_AB', [])
+            assert len(y_A) == n, 'y_A 长度必须为 {}'.format(n)
+            assert len(y_B) == n, 'y_B 长度必须为 {}'.format(n)
+            assert len(y_AB_raw) == p, 'y_AB 长度必须与参数个数一致'
+            for i in range(p):
+                assert len(y_AB_raw[i]) == n, 'y_AB[{}] 长度必须为 {}'.format(i, n)
+            y_AB = np.array(y_AB_raw, dtype=float)
+
+        else:
+            # 仅返回采样矩阵
+            return_data = {
+                'param_names': param_names,
+                'n': n,
+                'p': p,
+                'sample_A': A.tolist(),
+                'sample_B': B.tolist(),
+                'sample_A_B_i': [AB.tolist() for AB in A_B_i],
+                'total_evaluations': n * (p + 2),
+                'description': '评估模型后，将 y_A / y_B / y_AB 加上 param_ranges 再次调用即可计算 Sobol 指数',
+            }
+            dict_return_data['return_data'] = return_data
+            dict_return_data['success'] = True
+            dict_return_data['errorMsg'] = ''
+            return json.dumps(dict_return_data, ensure_ascii=False)
+
+        # ════════════════════════════════════════
+        # ── 计算 Sobol 指数 ──
+        # ════════════════════════════════════════
+        all_y = np.concatenate([y_A, y_B] + [y_AB[i] for i in range(p)])
+        f0 = np.mean(all_y)
+        var_Y = np.var(all_y, ddof=0)
+
+        first_order = []
+        total_order = []
+        interaction = []
+
+        for i in range(p):
+            Si = (np.mean(y_B * y_AB[i]) - f0 ** 2) / var_Y
+            STi = 1.0 - (np.mean(y_A * y_AB[i]) - f0 ** 2) / var_Y
+            Si = max(-0.1, min(1.1, Si))
+            STi = max(-0.1, min(1.1, STi))
+            first_order.append(round(float(Si), 6))
+            total_order.append(round(float(STi), 6))
+            interaction.append(round(float(STi - Si), 6))
+
+        # ── 重要性排序 ──
+        indices_sorted = sorted(
+            range(p), key=lambda i: abs(first_order[i]), reverse=True)
+        ranking = []
+        for idx in indices_sorted:
+            ranking.append({
+                'rank': len(ranking) + 1,
+                'variable': param_names[idx],
+                'first_order': first_order[idx],
+                'total_order': total_order[idx],
+                'interaction': interaction[idx],
+            })
+
+        # ── 采样点也返回，方便用户检查 ──
+        return_data = {
+            'param_names': param_names,
+            'n': n,
+            'p': p,
+            'f0': round(float(f0), 6),
+            'var_Y': round(float(var_Y), 6),
+            'first_order': first_order,
+            'total_order': total_order,
+            'interaction': interaction,
+            'ranking': ranking,
+            'sample_A': A.tolist(),
+            'sample_B': B.tolist(),
+            'sample_A_B_i': [AB.tolist() for AB in A_B_i],
+            'total_evaluations': n * (p + 2),
+            'interpretation': {
+                'first_order': '一阶指数: 该变量单独对输出方差的贡献占比，越大越重要',
+                'total_order': '总阶指数: 该变量及其所有交互作用对输出方差的贡献占比',
+                'interaction': '交互效应 = 总阶 − 一阶，越大表示该变量与其他变量的交互越强',
+            },
+        }
+
+        dict_return_data['return_data'] = return_data
+        dict_return_data['success'] = True
+        dict_return_data['errorMsg'] = ''
+
+    except Exception as e:
+        dict_return_data['return_data'] = {}
+        dict_return_data['success'] = False
+        dict_return_data['errorMsg'] = str(e)
+        print("报错日志：{}".format(e))
+        logger.error("报错日志：{}".format(e))
 
     return json.dumps(dict_return_data, ensure_ascii=False)
 
