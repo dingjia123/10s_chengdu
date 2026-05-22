@@ -6553,6 +6553,191 @@ def global_regression_coefficient():
     return json.dumps(dict_return_data, ensure_ascii=False)
 
 
+@app.route('/localRegressionCoefficient', methods=['POST'])
+def local_regression_coefficient():
+    '''
+    局部回归系数 —— 基于局部加权线性回归的变系数分析
+    对每个查询点拟合局部加权回归，返回该点处的局部系数、截距和预测值
+    可观察回归系数随自变量的变化趋势，揭示非线性关系
+    :return: 各查询点的局部系数、截距、预测值及系数变化轨迹
+    '''
+    if request.method == "POST":
+        inputs = request.get_json()
+
+    dict_return_data = {}
+    try:
+        data_x = inputs['data_x']                       # 训练数据自变量
+        data_y = inputs['data_y']                       # 训练数据因变量
+        columns_x = inputs['columns_x']                 # 自变量名称
+        column_y = inputs.get('column_y', 'y')          # 因变量名称
+        kernel = inputs.get('kernel', 'tricube')        # 核函数类型
+        bandwidth = inputs.get('bandwidth', 0.4)        # 带宽比例 (0~1)
+        query_x = inputs.get('query_x', None)           # 查询点（可选）
+        n_grid = inputs.get('n_grid', 50)               # 自动生成网格点数
+
+        X_train = np.array(data_x, dtype=float)
+        y_train = np.array(data_y, dtype=float)
+        n, p = X_train.shape
+        assert n >= p + 2, '样本量至少比自变量个数多 2'
+        assert 0 < bandwidth <= 1, 'bandwidth 需在 (0, 1] 范围内'
+        assert len(columns_x) == p, 'columns_x 与 data_x 列数不符'
+        assert len(y_train) == n, 'data_x 与 data_y 样本量不一致'
+
+        # ── 确定查询点 ──
+        if query_x is not None:
+            X_query = np.array(query_x, dtype=float)
+            if X_query.ndim == 1:
+                X_query = X_query.reshape(-1, 1)
+            assert X_query.shape[1] == p, 'query_x 列数与 data_x 不一致'
+        else:
+            # 沿每个维度均匀生成网格点
+            if p == 1:
+                x_min, x_max = X_train.min(axis=0)[0], X_train.max(axis=0)[0]
+                margin = (x_max - x_min) * 0.05
+                X_query = np.linspace(x_min - margin, x_max + margin, n_grid).reshape(-1, 1)
+            else:
+                # 多维：对每个变量在观测范围内取等间隔点
+                grid_1d = np.linspace(0, 1, n_grid)
+                X_query_list = []
+                for i in range(p):
+                    x_min, x_max = X_train[:, i].min(), X_train[:, i].max()
+                    margin = (x_max - x_min) * 0.05
+                    vals = x_min - margin + grid_1d * (x_max - x_min + 2 * margin)
+                    X_query_list.append(vals)
+                X_query = np.column_stack(X_query_list)
+
+        n_query = X_query.shape[0]
+
+        # ── 定义核函数 ──
+        def _tricube(u):
+            """Tricube 核: (1 - |u|^3)^3, 用于 |u| < 1"""
+            result = np.zeros_like(u)
+            mask = np.abs(u) < 1
+            result[mask] = (1 - np.abs(u[mask]) ** 3) ** 3
+            return result
+
+        def _gaussian(u):
+            """高斯核: exp(-0.5 * u^2)"""
+            return np.exp(-0.5 * u ** 2)
+
+        def _epanechnikov(u):
+            """Epanechnikov 核: 0.75*(1 - u^2), 用于 |u| < 1"""
+            result = np.zeros_like(u)
+            mask = np.abs(u) < 1
+            result[mask] = 0.75 * (1 - u[mask] ** 2)
+            return result
+
+        kernel_funcs = {'tricube': _tricube, 'gaussian': _gaussian, 'epanechnikov': _epanechnikov}
+        assert kernel in kernel_funcs, '不支持的核函数: {}，可选: {}'.format(kernel, '/'.join(kernel_funcs.keys()))
+        kernel_func = kernel_funcs[kernel]
+
+        # ── 对每个查询点计算局部加权回归 ──
+        local_intercepts = []
+        local_coefficients = []
+        local_predictions = []
+
+        X_aug = np.column_stack([np.ones(n), X_train])  # 设计矩阵 (带截距列)
+
+        for q_idx in range(n_query):
+            x_q = X_query[q_idx]
+
+            # 1. 计算距离与带宽
+            dists = np.sqrt(np.sum((X_train - x_q) ** 2, axis=1))
+            max_dist = np.percentile(dists, bandwidth * 100)
+            if max_dist == 0:
+                max_dist = np.max(dists) if np.max(dists) > 0 else 1.0
+
+            # 2. 计算核权重
+            u = dists / max_dist
+            weights = kernel_func(u)
+
+            # 3. 加权最小二乘法: β = (X^T W X)^{-1} X^T W y
+            W = np.diag(weights)
+            XtWX = X_aug.T @ W @ X_aug
+            XtWy = X_aug.T @ W @ y_train
+
+            try:
+                beta = np.linalg.solve(XtWX, XtWy)
+            except np.linalg.LinAlgError:
+                beta = np.linalg.lstsq(XtWX, XtWy, rcond=None)[0]
+
+            local_intercepts.append(float(beta[0]))
+            local_coefficients.append(beta[1:].tolist())
+
+            # 4. 预测
+            x_q_aug = np.concatenate([[1.0], x_q])
+            pred = float(x_q_aug @ beta)
+            local_predictions.append(round(pred, 6))
+
+        # ── 系数变化轨迹（含量化指标）──
+        coef_evolution = []
+        for i in range(p):
+            coef_trace = [round(row[i], 6) for row in local_coefficients]
+            arr_trace = np.array(coef_trace)
+            mean_abs = np.mean(np.abs(arr_trace))
+            rms = np.sqrt(np.mean(arr_trace ** 2))
+            std_val = np.std(arr_trace, ddof=1)
+            cv = round(std_val / mean_abs, 6) if mean_abs > 1e-10 else float('inf')
+            # 趋势斜率: 对 trace 做线性回归，斜率反映单调增减趋势
+            if n_query > 1:
+                x_idx = np.arange(n_query)
+                slope = np.polyfit(x_idx, arr_trace, 1)[0]
+            else:
+                slope = 0
+            coef_evolution.append({
+                'variable': columns_x[i],
+                'trace': coef_trace,
+                'min': round(min(coef_trace), 6),
+                'max': round(max(coef_trace), 6),
+                'range': round(max(coef_trace) - min(coef_trace), 6),
+                'mean_abs': round(float(mean_abs), 6),
+                'rms': round(float(rms), 6),
+                'std': round(float(std_val), 6),
+                'cv': round(float(cv), 6) if cv != float('inf') else 'inf',
+                'trend_slope': round(float(slope), 6),
+            })
+
+        # ── 各查询点的综合结果表 ──
+        query_results = []
+        for i in range(n_query):
+            row_dict = {}
+            for j in range(p):
+                row_dict[columns_x[j]] = round(X_query[i][j], 6)
+            for j in range(p):
+                row_dict[columns_x[j] + '_coef'] = round(local_coefficients[i][j], 6)
+            row_dict['intercept'] = round(local_intercepts[i], 6)
+            row_dict['prediction'] = local_predictions[i]
+            query_results.append(row_dict)
+
+        return_data = {
+            'sample_size': n,
+            'variables': p,
+            'columns_x': columns_x,
+            'column_y': column_y,
+            'kernel': kernel,
+            'bandwidth': bandwidth,
+            'n_query_points': n_query,
+            'query_results': query_results,
+            'local_intercepts': [round(v, 6) for v in local_intercepts],
+            'local_coefficients': [[round(v, 6) for v in row] for row in local_coefficients],
+            'local_predictions': local_predictions,
+            'coefficient_evolution': coef_evolution,
+        }
+
+        dict_return_data['return_data'] = return_data
+        dict_return_data['success'] = True
+        dict_return_data['errorMsg'] = ''
+
+    except Exception as e:
+        dict_return_data['return_data'] = {}
+        dict_return_data['success'] = False
+        dict_return_data['errorMsg'] = str(e)
+        print(f"报错日志：{e}")
+        logger.error(f"报错日志：{e}")
+
+    return json.dumps(dict_return_data, ensure_ascii=False)
+
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', debug=True, port=5130, threaded=True)
 
